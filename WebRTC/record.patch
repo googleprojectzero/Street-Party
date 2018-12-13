@@ -1,0 +1,249 @@
+Binary files src3/build/toolchain/wrapper_utils.pyc and src/build/toolchain/wrapper_utils.pyc differ
+diff -ur -x '*.a' -x '*.so' src3/call/BUILD.gn src/call/BUILD.gn
+--- src3/call/BUILD.gn	2018-12-05 14:49:06.641285826 -0800
++++ src/call/BUILD.gn	2018-12-05 15:46:18.471109646 -0800
+@@ -197,6 +197,7 @@
+     "flexfec_receive_stream_impl.h",
+     "receive_time_calculator.cc",
+     "receive_time_calculator.h",
++    "../rtc_base:rtc_json",
+   ]
+ 
+   deps = [
+diff -ur -x '*.a' -x '*.so' src3/call/call.cc src/call/call.cc
+--- src3/call/call.cc	2018-12-05 15:23:41.663020143 -0800
++++ src/call/call.cc	2018-12-05 15:49:48.578500058 -0800
+@@ -10,6 +10,8 @@
+ 
+ #include <string.h>
+ #include <algorithm>
++#include <atomic>
++#include <fstream>
+ #include <map>
+ #include <memory>
+ #include <set>
+@@ -64,6 +66,8 @@
+ #include "video/stats_counter.h"
+ #include "video/video_receive_stream.h"
+ #include "video/video_send_stream.h"
++#include "test/rtp_file_writer.h"
++#include "third_party/jsoncpp/source/include/json/json.h"
+ 
+ namespace webrtc {
+ 
+@@ -372,6 +376,11 @@
+   RtpTransportControllerSendInterface* transport_send_ptr_;
+   // Declared last since it will issue callbacks from a task queue. Declaring it
+   // last ensures that it is destroyed first and any running tasks are finished.
++
++  std::unique_ptr<test::RtpFileWriter> rtp_file_writer_;
++  std::vector<webrtc::VideoReceiveStream::Config> receive_configs_;
++  std::string record_path_;
++
+   std::unique_ptr<RtpTransportControllerSendInterface> transport_send_;
+ 
+   // This is a precaution, since |MediaTransportChange| is not guaranteed to be
+@@ -451,6 +460,13 @@
+       receive_time_calculator_(ReceiveTimeCalculator::CreateFromFieldTrial()),
+       video_send_delay_stats_(new SendDelayStats(clock_)),
+       start_ms_(clock_->TimeInMilliseconds()) {
++
++  static std::atomic<int> num_writers{};
++  int n = num_writers.fetch_add(1);
++  std::stringstream ss;
++  ss << "/path/to/where/you/want/to/dump/stuff/";
++  ss << clock_->TimeInMilliseconds() << "_" << n << "_" << this;
++  record_path_ = ss.str();
+   RTC_DCHECK(config.event_log != nullptr);
+   transport_send_ = std::move(transport_send);
+   transport_send_ptr_ = transport_send_.get();
+@@ -752,6 +768,7 @@
+     VideoEncoderConfig encoder_config,
+     std::unique_ptr<FecController> fec_controller) {
+   TRACE_EVENT0("webrtc", "Call::CreateVideoSendStream");
++
+   RTC_DCHECK_CALLED_SEQUENTIALLY(&configuration_sequence_checker_);
+ 
+   RegisterRateObserver();
+@@ -847,6 +864,19 @@
+     webrtc::VideoReceiveStream::Config configuration) {
+   TRACE_EVENT0("webrtc", "Call::CreateVideoReceiveStream");
+   RTC_DCHECK_CALLED_SEQUENTIALLY(&configuration_sequence_checker_);
++  if (config_.dump_rtp) {
++    receive_configs_.push_back(configuration.Copy());
++    Json::Value configs(Json::arrayValue);
++    for (const auto& conf : receive_configs_)
++      configs.append(conf.ToJson());
++
++    std::string config_path = record_path_;
++    config_path += "_config";
++    std::ofstream receive_configs_file(config_path);
++    Json::StyledWriter writer;
++    std::string raw_json = writer.write(configs);
++    receive_configs_file.write(raw_json.c_str(), raw_json.size());
++  }
+ 
+   VideoReceiveStream* receive_stream = new VideoReceiveStream(
+       &video_receiver_controller_, num_cpu_cores_,
+@@ -1352,7 +1382,22 @@
+   RTC_DCHECK_CALLED_SEQUENTIALLY(&configuration_sequence_checker_);
+   if (RtpHeaderParser::IsRtcp(packet.cdata(), packet.size()))
+     return DeliverRtcp(media_type, packet.cdata(), packet.size());
++  if (config_.dump_rtp && media_type == MediaType::VIDEO) {
++    if (!rtp_file_writer_) {
++      std::string rtp_path = record_path_;
++      rtp_path += "_rtpdump";
++      printf("RTP dump: %s\n", rtp_path.c_str());
++      rtp_file_writer_.reset(test::RtpFileWriter::Create(
++          test::RtpFileWriter::kRtpDump, rtp_path.c_str()));
++    }
+ 
++    test::RtpPacket p;
++    memcpy(p.data, packet.data(), packet.size());
++    p.length = packet.size();
++    p.original_length = packet.size();
++    p.time_ms = clock_->TimeInMilliseconds() - start_ms_;
++    RTC_CHECK(rtp_file_writer_->WritePacket(&p));
++  }
+   return DeliverRtp(media_type, std::move(packet), packet_time_us);
+ }
+ 
+diff -ur -x '*.a' -x '*.so' src3/call/call_config.h src/call/call_config.h
+--- src3/call/call_config.h	2018-12-05 14:49:06.645285814 -0800
++++ src/call/call_config.h	2018-12-05 15:30:28.345858685 -0800
+@@ -49,6 +49,8 @@
+ 
+   // Network controller factory to use for this call.
+   NetworkControllerFactoryInterface* network_controller_factory = nullptr;
++
++  bool dump_rtp = true;
+ };
+ 
+ }  // namespace webrtc
+diff -ur -x '*.a' -x '*.so' src3/call/video_receive_stream.cc src/call/video_receive_stream.cc
+--- src3/call/video_receive_stream.cc	2018-12-05 14:49:06.649285802 -0800
++++ src/call/video_receive_stream.cc	2018-12-05 16:16:27.113834992 -0800
+@@ -10,6 +10,7 @@
+ 
+ #include "call/video_receive_stream.h"
+ #include "rtc_base/strings/string_builder.h"
++#include "third_party/jsoncpp/source/include/json/json.h"
+ 
+ namespace webrtc {
+ 
+@@ -17,6 +18,68 @@
+ VideoReceiveStream::Decoder::Decoder(const Decoder&) = default;
+ VideoReceiveStream::Decoder::~Decoder() = default;
+ 
++
++
++
++Json::Value VideoReceiveStream::Decoder::ToJson() const {
++  Json::Value root;
++
++  root["payload_type"] = payload_type;
++
++
++  return root;
++}
++
++
++
++
++Json::Value VideoReceiveStream::Config::ToJson() const {
++  Json::Value root;
++
++  root["decoders"] = Json::Value(Json::arrayValue);
++  for (const auto& dec : decoders)
++    root["decoders"].append(dec.ToJson());
++
++  root["rtp"] = rtp.ToJson();
++  root["render_delay_ms"] = render_delay_ms;
++  root["target_delay_ms"] = target_delay_ms;
++
++  return root;
++}
++
++Json::Value VideoReceiveStream::Config::Rtp::ToJson() const {
++  Json::Value root;
++  root["remote_ssrc"] = remote_ssrc;
++  root["local_ssrc"] = local_ssrc;
++  root["rtcp_mode"] = rtcp_mode == RtcpMode::kCompound
++                          ? "RtcpMode::kCompound"
++                          : "RtcpMode::kReducedSize";
++  root["remb"] = remb;
++  root["transport_cc"] = transport_cc;
++  root["nack"]["rtp_history_ms"] = nack.rtp_history_ms;
++  root["ulpfec_payload_type"] = ulpfec_payload_type;
++  root["red_payload_type"] = red_payload_type;
++  root["rtx_ssrc"] = rtx_ssrc;
++
++  root["rtx_payload_types"] = Json::Value(Json::arrayValue);
++  for (auto& kv : rtx_associated_payload_types) {
++    Json::Value val;
++    val[std::to_string(kv.first)] = kv.second;
++    root["rtx_payload_types"].append(val);
++  }
++
++  root["extensions"] = Json::Value(Json::arrayValue);
++  for (auto& ext : extensions) {
++    Json::Value ext_json;
++    ext_json["uri"] = ext.uri;
++    ext_json["id"] = ext.id;
++    ext_json["encrypt"] = ext.encrypt;
++    root["extensions"].append(ext_json);
++  }
++
++  return root;
++}
++ 
+ std::string VideoReceiveStream::Decoder::ToString() const {
+   char buf[1024];
+   rtc::SimpleStringBuilder ss(buf);
+diff -ur -x '*.a' -x '*.so' src3/call/video_receive_stream.h src/call/video_receive_stream.h
+--- src3/call/video_receive_stream.h	2018-12-05 14:49:06.649285802 -0800
++++ src/call/video_receive_stream.h	2018-12-05 16:10:37.942859087 -0800
+@@ -28,6 +28,7 @@
+ #include "call/rtp_config.h"
+ #include "modules/rtp_rtcp/include/rtcp_statistics.h"
+ #include "modules/rtp_rtcp/include/rtp_rtcp_defines.h"
++#include "third_party/jsoncpp/source/include/json/json.h"
+ 
+ namespace webrtc {
+ 
+@@ -44,7 +45,8 @@
+     Decoder(const Decoder&);
+     ~Decoder();
+     std::string ToString() const;
+-
++    Json::Value ToJson() const;
++    Decoder(const Json::Value& json);
+     // Ownership stays with WebrtcVideoEngine (delegated from PeerConnection).
+     // TODO(nisse): Move one level out, to VideoReceiveStream::Config, and later
+     // to the configuration of VideoStreamDecoder.
+@@ -113,10 +115,11 @@
+     Config() = delete;
+     Config(Config&&);
+     explicit Config(Transport* rtcp_send_transport);
++    explicit Config(Transport* rtcp_send_transport, const Json::Value& json);
+     Config& operator=(Config&&);
+     Config& operator=(const Config&) = delete;
+     ~Config();
+-
++    Json::Value ToJson() const;
+     // Mostly used by tests.  Avoid creating copies if you can.
+     Config Copy() const { return Config(*this); }
+ 
+@@ -131,10 +134,10 @@
+       Rtp(const Rtp&);
+       ~Rtp();
+       std::string ToString() const;
+-
++      Rtp(const Json::Value& json);
+       // Synchronization source (stream identifier) to be received.
+       uint32_t remote_ssrc = 0;
+-
++      Json::Value ToJson() const;
+       // Sender SSRC used for sending RTCP (such as receiver reports).
+       uint32_t local_ssrc = 0;
+ 

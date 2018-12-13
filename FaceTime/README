@@ -1,0 +1,133 @@
+This tool allows FaceTime streams to be recorded and replayed on a MacBook. I tested this tool on a MacBook Air running macOS version 10.14.1.
+
+To use this tool, you will need two devices, a host and a target. For this version of the tool, the host needs to be a MacBook or Mac Mini. The target can be any device that supports FaceTime. Note that this tool is designed for two devices that cannot route IP traffic to one another, which is the most common use case. If you are having problems with the tool, try putting one device on WiFi and the other on the mobile network.
+
+WARNING: this tool has occasionally caused devices or applications to freeze in a way that the reset sequence does not work. This requires the device battery to be drained before the device can be used again. Only use this tool on devices that you do not need to use immediately after testing.
+
+WARNING: setting up this tool incorrectly can render the host device unable to boot, requiring the disk to be wiped before it is recovered. Make sure to back up your device before setting up this tool.
+
+WARNING: some features of the host device will not work correctly while the tool is in use. I recommend using a dedicated host device to run this tool.
+
+Set-up instructions:
+
+1) Back-up the host and target device so that you can restore them in case testing causes system problems and you need to factory reset the devices
+
+2) Disable System Integrity Protection on the host device https://developer.apple.com/library/archive/documentation/Security/Conceptual/System_Integrity_Protection_Guide/ConfiguringSystemIntegrityProtection/ConfiguringSystemIntegrityProtection.html
+
+3) Log into FaceTime on both devices, and make a FaceTime call between the devices to make sure they both work. Ensure that the call is recorded in the history of both devices. After you set up the tool you m not be able to call devices that are not in the call history.
+
+WARNING: some iCloud accounts I used this tool with appeared to be restricted in functionality after testing. I recommend creating new accounts to use this tool
+
+4) Install Xcode from the App Store on the host if it isn't already installed
+
+5) Download and build https://github.com/Tyilo/insert_dylib
+
+6) Copy /System/Library/Sandbox/Profiles/com.apple.avconferenced.sb to a local directory and add the line:
+
+	(subpath "/out")
+
+to the (allow file-read* file-write* section
+
+7) Copy the modified file back to /System/Library/Sandbox/Profiles/com.apple.avconferenced.sb (requires sudo)
+
+
+8) Copy /System/Library/Sandbox/Profiles/com.apple.identityservicesd.sb to a local directory and add the lines:
+
+	(allow file-read* file-write*
+		(subpath "/out"))
+
+9) Copy the modified file back to /System/Library/Sandbox/Profiles/com.apple.identityservicesd.sb (requires sudo) and restart the host
+
+10) Compile avc-record.cpp using:
+
+	g++ -std=c++11 -g -dynamiclib -o librecord.so avc-record.cpp
+
+11) Copy the output lib, librecord.so to /usr/lib/libSP.so (requires sudo)
+
+12) Sign the library by calling:
+
+	sudo codesign -f -s - /usr/lib/libSP.so
+
+13) Compile identity-record.cpp using:
+
+	g++ -std=c++11 -g -dynamiclib -o librecord_IDS.so identity-record.cpp
+
+Note that this file has a //fuzz here comment where fuzzing code can be added
+
+14) Copy the output lib, librecord_IDS.so to /usr/lib/libSP_IDS.so (requires sudo)
+
+15) Sign the library by calling:
+
+	sudo codesign -f -s - /usr/lib/libSP_IDS.so
+
+16) Copy /System/Library/PrivateFrameworks/AVConference.framework/Versions/Current/AVConference to a local directory and run the command below.
+
+	insert_dylib --strip-codesig /usr/lib/libSP.so AVConference
+
+17) Copy AVConference_patched to /System/Library/PrivateFrameworks/AVConference.framework/Versions/Current/AVConference (requires sudo)
+
+
+18) Sign the binary by calling:
+
+	sudo codesign -f -s - /System/Library/PrivateFrameworks/AVConference.framework/Versions/Current/AVConference
+
+19) Copy /System/Library/PrivateFrameworks/IDSFoundation.framework/Versions/Current/IDSFoundation to a local directory and run the command below.
+
+	insert_dylib --strip-codesig /usr/lib/libSP_IDS.so IDSFoundation
+
+20) Run the following commands, quickly, in sequence:
+
+	sudo cp IDSFoundation_patched /System/Library/PrivateFrameworks/IDSFoundation.framework/Versions/Current/IDSFoundation
+	sudo codesign -f -s - /System/Library/PrivateFrameworks/IDSFoundation.framework/Versions/Current/IDSFoundation
+
+NOTE: If you are too slow, the terminal may crash because it detects IDSFoundation is unsigned. If this happens, open up the terminal and try the codesign call again. The terminal usually stays open a second or two before it crashes.
+
+21) make the output directory:
+
+	sudo mkdir /out
+	sudo chmod 777 /out
+
+22) Kill the avconferenced process. It will restart automatically
+
+23) Kill the identityserviced process. It will restart automatically
+
+24) Make a FaceTime call. It should be recorded in /out
+
+Note: if you record a second call, it will overwrite the first one. Make sure to save the /out directory to a different location before recording your next call. Note that you must restart avconferenced and identityserviced every time you want to record a call
+
+To replay:
+
+- Put the call you want to replay in /out and chmod it to 777
+- Use video-replay-identity.cpp instead of identity-record.cpp for libSP_IDS.so
+- Use video-replay-avc.cpp instead of avc-record.cpp for libSP.so
+- Note that you must restart avconferenced and identityserviced every time you want to replay the call
+
+Troubleshooting:
+
+Q: The screen is black when I try to record or replay a call
+
+A: Try restarting the target device, as well as avconferenced and identityserviced and trying again. Sometimes target devices get stuck in a bad state and don't decrypt calls. Restarting them usually fixes this.
+
+Q: The call doesn't connect
+
+A: Restarting the target device, as well as avconferenced and identityserviced. One of these is probably in a bad state
+
+Q: FaceTime crashes when I try to make a call
+
+A: Check that:
+
+- The host and target device are not peer-to-peer routable
+- /out exists and is world read and writable
+- You've modified the sandbox files and restarted the host
+
+Q: No, it's really crashing
+
+A: File a bug on the github. Please include a stack trace of the crash with symbols and a pcap of the traffic while the call was made.
+
+Q: I've followed the instuctions, but nothing is output in /out
+
+A: Put a breakpoint on the hooks on sendmsg and CCCryptorUpdate, annd see if they are being hooked. If they are, check that the process names that are being filtered are correct. This is one of the most fragile parts of this setup, and you might be able to fix it by putting in the correct name. If they are not being hooked, check that the libraries are being loaded. It's not unusual for the binaries that are modified with insert_dylib to revert to their unmodified versions for no reason. If this still doesn't work, file a bug in GitHub.
+
+Q: I restarted my host and everything is crashing
+
+A: Sorry, this is probably due to failed signing checks. Restore AVConference and IDSFoundation to their original forms, restart your system again, and then put back the modified versions.

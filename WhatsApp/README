@@ -1,0 +1,56 @@
+WhatsApp RTP Replay
+
+This setup requires a rooted Android device with a specific version of WhatsApp. This is version 2.18.248 (arm64-v8a). To check that you have the correct version, check that the sha1sum of libwhatsapp.so is cfdb0266cbd6877e5d146ddd59fa83ebccdd0. The go through the following steps:
+
+1) Use bsdiff to apply patch.diff to libwhatsapp.so. The SHA1 of the original library is cfdb0266cbd6877e5d146ddd59fa83ebccdd013d, and the SHA1 of the modified library is 042256f240367eaa4a096527d1afbeb56ab2eeb4.
+
+2) use adb push to put your library of choice at /data/data/com.whatsapp/libn.so, and chmod it to octal 777.
+
+	The following libraries are available:
+
+		record.c -- records RTP with no alteration
+
+		fuzz.c -- sample fuzzer for RTP
+
+		replay.c -- replays RTP
+
+	Look in the repository for prebuilt ARM64 versions of these libraries.
+
+3) Restart WhatApp using "Force stop" in the Android Settings menu
+
+4) Calls should be recorded/replayed. Output is in /data/data/com.whatsapp/files
+
+
+Troubleshooting
+
+1) When I install this version of the app, I get a message that it is too old.
+
+One way to get around this is to install a version that works, and then use adb pull to save /data/data/com.whatsapp. Then install the other version, and before you start it, restore the directory to the same location (don't forget to give it the permissions the application need to access it). The start the app. This usually works, because the version check only occurs when registering the device with WhatsApp.
+
+If this doesn't work, you can try modifying the current version. To do this, open the library in IDA and search for the string "%s: function srtp_protect". Use cross references to look for the function that uses the string, which is srtp_protect. Then use cross references to find the caller of srtp_protect. This function should have a call "BL .memcpy" about 10 instructions before the call to srtp_unprotect. This is the memcpy you want to hook. Find somewhere to put the following code (I recommend overwriting the GIF transcoder):
+
+MOV             X21, X30
+MOV             X22, X0
+MOV             X23, X1
+MOV             X20, X2
+MOV             X1, #1
+ADRP            X0, #aDataDataCom_wh@PAGE ; "/data/data/com.whatsapp/libn.so"
+ADD             X0, X0, #aDataDataCom_wh@PAGEOFF ; "/data/data/com.whatsapp/libn.so"
+BL              .dlopen
+ADRP            X1, #aApthread@PAGE ; "apthread"
+ADD             X1, X1, #aApthread@PAGEOFF ; "apthread"
+BL              .dlsym
+MOV             X8, X0
+MOV             X0, X22
+MOV             X1, X23
+MOV             X2, X20
+NOP
+BLR             X8
+MOV             X30, X21
+RET
+
+Then point the memcpy to this function. Note that you will need to correct the strings to point to somewhere in memory with the correct string. Also, this code does not respect calling conventions, so if it doesn't work, make sure it isn't overwriting a register that's needed (it won't in version 2.18.248).
+
+2) The app suddenly stops working when fuzzing
+
+libwhatsapp.so will be restored to the unmodified version if the device resets. Make sure it is still modified. Also make sure there is still space left on the device. Recording RTP fills it up quite quickly.
