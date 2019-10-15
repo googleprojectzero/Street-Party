@@ -1,0 +1,29 @@
+FaceTime Replay for Frida!
+
+This implementation has some limitations compared to the native implementation, specifically it is slow enough to alter the behavior of the audio and video streams. That said, it is much faster to set up than the native version.
+
+Set-up instructions:
+
+1) Add the line:
+
+	(subpath "/out")
+
+to the (allow file-read* file-write* section of  /System/Library/Sandbox/Profiles/com.apple.avconferenced.sb, and restart the host
+
+2) Create the directory /out and make it world-readable
+
+3) Install frida, and run the following in the local directory
+
+python3 dumpIncomingMessages.py 
+
+Note that this runs on an MacBook Air on version 10.14.6. For a different version, the offsets of the hooked methods in the JS files need to be recalculated.
+
+4) Use FaceTime to call the target and answer the call. This call will be recorded in /out
+
+To reproduce the call:
+
+1) Run:
+
+python3 replay.py
+
+2) Use FaceTime to call the target and answer the call.  
